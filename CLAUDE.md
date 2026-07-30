@@ -4,45 +4,53 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository overview
 
-This is a small, single-file Telegram bot: `ecommerce_crawler.py`. It receives Volvo Penta part numbers via Telegram messages, scrapes `https://www.volvopenta.com/shop/0/parts/<part_number>` with Playwright (headless Chromium), extracts part details via regex/DOM parsing, and replies with a summary plus a downloadable results file.
+This is a small, single-file Telegram bot: `ecommerce_crawler.py`. It receives Volvo Penta part numbers via Telegram messages, scrapes `https://www.volvopenta.com/shop/0/parts/<part_number>`, extracts part details via regex, and replies with a summary plus a downloadable results file.
 
 There is no build system, package manifest, test suite, or CI configuration in this repo — it is one script with no other supporting modules.
 
 ## Running the bot
 
-The script depends on `python-telegram-bot` and `playwright`, neither of which is vendored or pinned in a requirements file. To run it locally:
+Dependencies are not vendored or pinned in a requirements file. The only required install is:
 
 ```bash
-pip install python-telegram-bot playwright
-playwright install chromium
+pip install python-telegram-bot
 python ecommerce_crawler.py
 ```
 
-Before running, set a real bot token — `BOT_TOKEN` is hardcoded as a placeholder at the top of `ecommerce_crawler.py` (`"YOUR_BOT_TOKEN_HERE"`). Do not commit a real token; prefer swapping this to read from an environment variable if you touch this code.
+`httpx` (used for the browserless scrape path) comes in automatically as a hard dependency of `python-telegram-bot`, so it never needs installing separately.
+
+Playwright is **optional** — only needed if the site stops server-rendering part data and the browser fallback has to kick in (see below). Install it only if results come back `Fetched via : browser`:
+
+```bash
+pip install playwright && playwright install chromium
+```
+
+Configuration is via environment variables:
+- `BOT_TOKEN` — required; falls back to the placeholder `"YOUR_BOT_TOKEN_HERE"` if unset.
+- `OUTPUT_DIR` — where result/debug files are written. Defaults to `/storage/emulated/0` when that directory exists (Android/Termux), otherwise the current working directory.
 
 There are no test, lint, or build commands configured for this project.
 
-## Code structure (single file: `ecommerce_crawler.py`)
+## Scrape architecture (the important part)
 
-The script is organized around one async scrape pipeline plus a thin Telegram handler layer:
+`scrape_part()` is a **two-tier pipeline that picks the cheapest path that works**, decided at runtime rather than hardcoded:
 
-- `scrape_part(part_number)` — launches a headless Chromium instance via Playwright (sandbox flags disabled, mobile Chrome user agent), navigates to the part's URL, waits for network idle + a fixed extra delay for JS rendering, then pulls the full page body text and extracts fields with targeted regexes:
-  - name (from the first `<h1>`)
-  - price (`$` pattern match)
-  - weight (`Weight incl. packaging` pattern)
-  - category (matched against a fixed list of known system names)
-  - `fits_products` (parsed out of a "Fits products" section, matched against an alphanumeric model-code regex)
+1. `_scrape_http()` — one plain `httpx` GET, no browser. `_html_to_text()` flattens the raw HTML into visible-ish text (drops `<script>`/`<style>`, converts tags to newlines, unescapes entities including `&nbsp;`) so the same regexes can run over it.
+2. `_scrape_browser()` — only if tier 1 returns no usable data. Launches headless Chromium via Playwright and reads `body.inner_text()`. **The `playwright` import is deliberately lazy (inside the function)** so the package is not needed at all when tier 1 succeeds.
 
-  It also writes a debug dump of the first 5000 characters of page text to a hardcoded Android path (`/storage/emulated/0/debug_<part_number>.txt`) — this assumes the bot runs inside Termux/Android, not a generic server. Returns a result dict with a `status` of `"success"` or `"failed"` and an `error` message when applicable.
+Both tiers feed the same `_extract_fields()` (price, weight, category, fits-products) so extraction logic stays in one place; only name extraction differs (`<h1>` regex vs. `h1` locator). A tier "succeeds" if it found either a name or a price — that's `_has_data()`.
 
-- `format_result(data)` — renders one result dict as a plain-text block for the summary file.
+The chosen tier is recorded in `result["method"]` (`"http"` / `"browser"`) and surfaced in output as `Fetched via :`. This is the signal for whether Playwright is still needed at all. If both tiers fail, `result["error"]` contains both tiers' errors joined by `|`.
 
-- `start` / `handle_message` — Telegram handlers. `handle_message` parses one or more part numbers out of a free-text message (regex `[A-Za-z0-9\-]{4,}`, deduplicated), scrapes them sequentially (not concurrently), edits a "Processing i/N" status message as it goes, writes all results to a timestamped file at `/storage/emulated/0/volvo_parts_<timestamp>.txt` (same Android-path assumption as the debug dump), sends a summary, reports the first failure's error inline, and finally uploads the results file back to the chat.
+`result["fits_products"]` is reset between tiers so a partial tier-1 extraction can't pollute tier-2 results.
 
-- `main()` — builds the `Application`, registers `/start` and the catch-all text handler, and runs polling.
+## Extraction gotchas
 
-## Key conventions / gotchas
+- Scraping is best-effort and regex-based against page text, not structured selectors, so upstream markup/copy changes can silently degrade field extraction. "Page loaded but nothing matched" is treated as a possible bot block, not a parsing bug.
+- **Category** picks the *longest* match, not the first. Generic names in the list (`Filter`, `Engine`, `Hose`) also appear inside part names ("Oil Filter"), which sit earlier in the page than the real category — leftmost-match would return the wrong one.
+- **Fits products** uses `\b([A-Z]{1,5}\d{1,5}[A-Z0-9\-]*)\b` with a `len >= 4` filter. The `\d{1,5}` (rather than `{2,5}`) is what allows single-digit series like `D4-260`.
+- Debug dumps (`debug_<part>_<http|browser>.txt`, first 5000 chars) are best-effort — wrapped so an unwritable `OUTPUT_DIR` can never fail a scrape.
 
-- All file output paths (`/storage/emulated/0/...`) are hardcoded for an Android/Termux environment. If adapting this to run elsewhere, these paths need to change or be made configurable.
-- Scraping is best-effort and regex-based against live page text; there's no structured selector-based extraction, so upstream site markup/copy changes can silently degrade field extraction (the code treats "page loaded but nothing matched" as a possible bot block, not a parsing bug).
-- Part numbers are uppercased and stripped before use; multiple part numbers in a single Telegram message are processed one at a time, in order.
+## Telegram layer
+
+`handle_message` parses part numbers out of free text (regex `[A-Za-z0-9\-]{4,}`, deduplicated, uppercased), scrapes them **sequentially, not concurrently**, edits a "Processing i/N" status message as it goes, writes all results to `<OUTPUT_DIR>/volvo_parts_<timestamp>.txt`, sends a summary, reports the first failure's error inline, then uploads the results file. `main()` registers `/start` plus the catch-all text handler and runs polling.
