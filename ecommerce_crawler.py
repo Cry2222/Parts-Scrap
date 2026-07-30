@@ -1,14 +1,157 @@
 import re
 import os
-import asyncio
+import html as html_lib
 from datetime import datetime
+
+import httpx
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from playwright.async_api import async_playwright
 
 # ========== CONFIG ==========
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+
+# Android/Termux writes to shared storage; anywhere else falls back to the
+# working directory so the bot can run on a plain server too.
+ANDROID_DIR = "/storage/emulated/0"
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR") or (
+    ANDROID_DIR if os.path.isdir(ANDROID_DIR) else os.getcwd()
+)
+
+USER_AGENT = (
+    "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+)
 # ============================
+
+
+def _html_to_text(html: str) -> str:
+    """Flatten raw HTML into visible-ish text so the same regexes work on it."""
+    html = re.sub(r'(?is)<(script|style|noscript)[^>]*>.*?</\1>', ' ', html)
+    html = re.sub(r'(?s)<[^>]+>', '\n', html)
+    html = html_lib.unescape(html).replace('\xa0', ' ')  # &nbsp; -> real space
+    html = re.sub(r'[ \t\r\f\v]+', ' ', html)
+    html = re.sub(r'\n[ ]*(\n[ ]*)+', '\n', html)
+    return html.strip()
+
+
+def _extract_name_from_html(html: str) -> str:
+    match = re.search(r'(?is)<h1[^>]*>(.*?)</h1>', html)
+    if not match:
+        return ""
+    name = _html_to_text(match.group(1)).replace("\n", " ")
+    return name.replace("Parts:", "").strip()
+
+
+def _extract_fields(result: dict, full_text: str):
+    """Pull price/weight/category/fits out of page text (shared by both paths)."""
+    price_match = re.search(r'\$[\d,]+\.?\d*', full_text)
+    if price_match:
+        result["price"] = price_match.group(0)
+
+    weight_match = re.search(
+        r'Weight incl\. packaging[:\s]*([\d.,]+\s*(lbs|kg|lb))', full_text, re.IGNORECASE
+    )
+    if weight_match:
+        result["weight"] = weight_match.group(1).strip()
+
+    # Prefer the most specific match: generic words like "Filter" also occur in
+    # part names ("Oil Filter"), which sit earlier in the page than the category.
+    cat_matches = re.findall(
+        r'(Fuel System|Lubricating and Oil System|Cooling System|Electrical System|Engine|Transmission|Propulsion|Filter|Hose|Bearing)',
+        full_text, re.IGNORECASE
+    )
+    if cat_matches:
+        result["category"] = max(cat_matches, key=len)
+
+    fits_section = re.search(
+        r'Fits products(.*?)(Dealer information|Log in|Choose dealer|Specifications|$)',
+        full_text, re.IGNORECASE | re.DOTALL
+    )
+    if fits_section:
+        # \d{1,5} (not {2,5}) so single-digit series like "D4-260" are caught too.
+        models = re.findall(r'\b([A-Z]{1,5}\d{1,5}[A-Z0-9\-]*)\b', fits_section.group(1))
+        seen = set()
+        for m in models:
+            if m not in seen and len(m) >= 4:
+                seen.add(m)
+                result["fits_products"].append(m)
+
+
+def _save_debug(part_number: str, text: str, suffix: str):
+    """Best-effort page dump for debugging; never fails the scrape."""
+    try:
+        path = os.path.join(OUTPUT_DIR, f"debug_{part_number}_{suffix}.txt")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text[:5000])
+    except OSError:
+        pass
+
+
+def _has_data(result: dict) -> bool:
+    return result["name"] != "N/A" or result["price"] != "N/A"
+
+
+async def _scrape_http(url: str, result: dict) -> bool:
+    """Fast path: one plain HTTP request, no browser. Works if the site
+    server-renders the part data into the HTML it returns."""
+    async with httpx.AsyncClient(
+        headers={"User-Agent": USER_AGENT}, follow_redirects=True, timeout=20
+    ) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        html = resp.text
+
+    full_text = _html_to_text(html)
+    _save_debug(result["part_number"], full_text, "http")
+
+    name = _extract_name_from_html(html)
+    if name:
+        result["name"] = name
+    _extract_fields(result, full_text)
+
+    return _has_data(result)
+
+
+async def _scrape_browser(url: str, result: dict) -> bool:
+    """Fallback: render with headless Chromium for client-side-only pages.
+    Imported lazily so Playwright is only needed if the fast path fails."""
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--single-process",
+                "--no-zygote",
+            ]
+        )
+        try:
+            context = await browser.new_context(
+                user_agent=USER_AGENT,
+                viewport={"width": 1280, "height": 720},
+                java_script_enabled=True,
+            )
+            page = await context.new_page()
+
+            await page.goto(url, wait_until="networkidle", timeout=60000)
+            await page.wait_for_timeout(5000)  # extra wait for JS
+
+            full_text = await page.locator("body").inner_text()
+            _save_debug(result["part_number"], full_text, "browser")
+
+            if await page.locator("h1").count() > 0:
+                name = await page.locator("h1").first.inner_text()
+                result["name"] = name.replace("Parts:", "").strip()
+
+            _extract_fields(result, full_text)
+        finally:
+            await browser.close()
+
+    return _has_data(result)
 
 
 async def scrape_part(part_number: str) -> dict:
@@ -23,95 +166,30 @@ async def scrape_part(part_number: str) -> dict:
         "weight": "N/A",
         "fits_products": [],
         "url": url,
+        "method": "N/A",
         "status": "failed",
         "error": ""
     }
 
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--single-process",
-                    "--no-zygote",
-                ]
-            )
+    errors = []
 
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
-                viewport={"width": 1280, "height": 720},
-                java_script_enabled=True,
-            )
-
-            page = await context.new_page()
-
-            # Go to page
-            await page.goto(url, wait_until="networkidle", timeout=60000)
-            await page.wait_for_timeout(5000)  # extra wait for JS
-
-            full_text = await page.locator("body").inner_text()
-
-            # ===== DEBUG: Save page text for checking =====
-            debug_file = f"/storage/emulated/0/debug_{part_number}.txt"
-            with open(debug_file, "w", encoding="utf-8") as f:
-                f.write(full_text[:5000])  # save first 5000 characters
-
-            # Name
-            try:
-                if await page.locator("h1").count() > 0:
-                    name = await page.locator("h1").first.inner_text()
-                    result["name"] = name.replace("Parts:", "").strip()
-            except:
-                pass
-
-            # Price
-            price_match = re.search(r'\$[\d,]+\.?\d*', full_text)
-            if price_match:
-                result["price"] = price_match.group(0)
-
-            # Weight
-            weight_match = re.search(r'Weight incl\. packaging[:\s]*([\d.,]+\s*(lbs|kg|lb))', full_text, re.IGNORECASE)
-            if weight_match:
-                result["weight"] = weight_match.group(1).strip()
-
-            # Category
-            cat_match = re.search(
-                r'(Fuel System|Lubricating and Oil System|Cooling System|Electrical System|Engine|Transmission|Propulsion|Filter|Hose|Bearing)',
-                full_text, re.IGNORECASE
-            )
-            if cat_match:
-                result["category"] = cat_match.group(1)
-
-            # Fits products
-            fits_section = re.search(
-                r'Fits products(.*?)(Dealer information|Log in|Choose dealer|Specifications|$)',
-                full_text, re.IGNORECASE | re.DOTALL
-            )
-            if fits_section:
-                section_text = fits_section.group(1)
-                models = re.findall(r'\b([A-Z]{1,5}\d{2,5}[A-Z0-9\-]*)\b', section_text)
-                seen = set()
-                for m in models:
-                    if m not in seen and len(m) >= 4:
-                        seen.add(m)
-                        result["fits_products"].append(m)
-
-            if result["name"] != "N/A" or result["price"] != "N/A":
+    # Try the cheap request first, only spin up a browser if it comes back empty.
+    for method, scraper in (("http", _scrape_http), ("browser", _scrape_browser)):
+        # Reset partial extractions so a failed attempt can't pollute the next one.
+        result["fits_products"] = []
+        try:
+            if await scraper(url, result):
+                result["method"] = method
                 result["status"] = "success"
-            else:
-                result["status"] = "failed"
-                result["error"] = "Page loaded but no useful data found (possible bot block)"
+                return result
+            errors.append(f"{method}: no useful data found")
+        except ImportError:
+            errors.append("browser: playwright not installed")
+        except Exception as e:
+            errors.append(f"{method}: {str(e)[:120]}")
 
-            await browser.close()
-
-    except Exception as e:
-        result["status"] = "failed"
-        result["error"] = str(e)[:200]
-
+    result["status"] = "failed"
+    result["error"] = " | ".join(errors)[:200]
     return result
 
 
@@ -127,6 +205,7 @@ def format_result(data: dict) -> str:
         f"Fits Models : {len(data['fits_products'])} found\n"
         f"{fits}\n"
         f"URL         : {data['url']}\n"
+        f"Fetched via : {data['method']}\n"
         f"Status      : {data['status']}\n"
     )
     if data.get("error"):
@@ -172,7 +251,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Save file
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"volvo_parts_{timestamp}.txt"
-    filepath = f"/storage/emulated/0/{filename}"
+    filepath = os.path.join(OUTPUT_DIR, filename)
 
     with open(filepath, "w", encoding="utf-8") as f:
         f.write("Volvo Penta Parts Lookup\n")
