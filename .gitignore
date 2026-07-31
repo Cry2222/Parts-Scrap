@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+
+# scraper output
+debug_*.txt
+volvo_parts_*.txt
