@@ -4,9 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository overview
 
-This is a small, single-file Telegram bot: `ecommerce_crawler.py`. It receives Volvo Penta part numbers via Telegram messages, scrapes `https://www.volvopenta.com/shop/0/parts/<part_number>`, extracts part details (name, price, weight, category, photo, fits-models), and replies with a per-part photo plus a downloadable results file.
+Two front-ends over one scraper, for looking up Volvo Penta parts by number:
 
-There is no build system, package manifest, test suite, or CI configuration in this repo — it is one script with no other supporting modules.
+- **`ecommerce_crawler.py`** — a Telegram bot, and the home of all scraping logic. Receives part numbers via chat, scrapes `https://www.volvopenta.com/shop/0/parts/<part_number>`, extracts part details (name, price, weight, category, photo, fits-models), and replies with a per-part photo plus a downloadable results file.
+- **`mobile_app.py`** — a local mobile web app. Runs an HTTP server on the device itself and serves a touch-friendly page; intended for Termux on Android, opened at `http://localhost:8000`.
+
+**`mobile_app.py` imports `scrape_part` from `ecommerce_crawler` rather than reimplementing it** — scraping changes must go in `ecommerce_crawler.py` so both front-ends stay in sync. The app also reuses `format_result` so its saved file is byte-identical to the bot's.
+
+There is no build system, package manifest, test suite, or CI configuration in this repo.
 
 ## Running the bot
 
@@ -30,6 +35,20 @@ Configuration is via environment variables:
 - `OUTPUT_DIR` — where result/debug files are written. Defaults to `/storage/emulated/0` when that directory exists (Android/Termux), otherwise the current working directory.
 
 There are no test, lint, or build commands configured for this project.
+
+## Running the mobile app
+
+```bash
+python mobile_app.py     # then open http://localhost:8000 on the device
+```
+
+Stdlib-only (`http.server`) — no web framework, and `BOT_TOKEN` is not needed. Extra environment variables:
+- `PORT` — listen port, default `8000`.
+- `HOST` — bind address, default `127.0.0.1`. Set `0.0.0.0` to reach it from another device on the same Wi-Fi.
+
+Routes: `GET /` (the page), `GET /api/part?number=<pn>` (scrapes one part, returns the result dict as JSON), `POST /api/save` (takes a JSON array of results, writes the `.txt`, returns its filename), `GET /download/<filename>` (serves it from `OUTPUT_DIR`, `basename()`-guarded against path traversal).
+
+The page scrapes **one part per request** so results stream in and the progress bar advances, rather than blocking on a single batch call. `ThreadingHTTPServer` plus `asyncio.run()` per request bridges the sync server to the async scraper.
 
 ## Scrape architecture (the important part)
 
